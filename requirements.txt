@@ -1,0 +1,9 @@
+mediapipe==1.0.1
+opencv-contrib-python==5.0.0.93
+PyAutoGUI==0.9.54
+numpy==2.5.3
+PySide6-Essentials==6.11.2
+# macOS only: pip skips these lines on Windows
+pyobjc-framework-Quartz==12.2.2; sys_platform == "darwin"
+pyobjc-framework-Cocoa==12.2.2; sys_platform == "darwin"
+pyobjc-core==12.2.2; sys_platform == "darwin"
