@@ -36,11 +36,6 @@ Settings changed in the app are saved to `%LOCALAPPDATA%\HandGesture\settings.js
 .venv\Scripts\python.exe main.py
 ```
 
-Hold an open palm still for 0.5s to arm or disarm. Esc quits.
-
-- 1 finger up: POINTER. Move the cursor, tap the index finger down and back up to left click.
-- 2 fingers up: PAGE. Move up or down to scroll, move sideways to scroll sideways, tilt the hand left or right for back or forward, tap both fingers down and back up to refresh (F5 on Windows, Cmd+R on macOS).
-
 In a dim room, `--low-light` contrast-boosts the copy of each frame used for detection. It can also make detection worse, so compare with it off. The desktop app has the same switch under Settings > Camera.
 
 ## Without moving the real mouse
