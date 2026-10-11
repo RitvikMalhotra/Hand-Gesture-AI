@@ -127,6 +127,17 @@ class BaseController:
         # action is "refresh"; each backend picks the key.
         raise NotImplementedError
 
+    def mouse_down(self):
+        # Left button down at the cursor, held until mouse_up. Used by the POINTER drag.
+        raise NotImplementedError
+
+    def mouse_up(self):
+        raise NotImplementedError
+
+    def volume(self, delta_pct):
+        # Changes system volume by delta_pct percentage points, clamped to 0..100.
+        raise NotImplementedError
+
     def release(self):
         pass
 
@@ -169,6 +180,15 @@ class DryRunController(BaseController):
     def key(self, action):
         self._log("key", action)
 
+    def mouse_down(self):
+        self._log("mouse_down", None)
+
+    def mouse_up(self):
+        self._log("mouse_up", None)
+
+    def volume(self, delta_pct):
+        self._log("volume", round(float(delta_pct), 4))
+
 
 def dispatch(controller, event):
     # Sends one gesture event to the output layer.
@@ -186,3 +206,10 @@ def dispatch(controller, event):
         controller.nav(event.value)
     elif event.kind == "key":
         controller.key(event.value)
+    elif event.kind == "drag":
+        if event.value[0] == "down":
+            controller.mouse_down()
+        else:
+            controller.mouse_up()
+    elif event.kind == "volume":
+        controller.volume(event.value)

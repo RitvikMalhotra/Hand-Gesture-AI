@@ -94,7 +94,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(self.settings)
         side.addWidget(scroll, 1)
-        hint = QLabel("Still open palm 0.5 s arms or disarms  ·  two fingers + tilt for back / forward  ·  tap both fingers to refresh  ·  Esc quits")
+        hint = QLabel("Still open palm 0.5 s arms or disarms  ·  hold the index down and move to drag  ·  two fingers + tilt for back / forward  ·  tap both fingers to refresh  ·  three fingers up / down for volume  ·  Esc quits")
         hint.setWordWrap(True)
         hint.setObjectName("Muted")
         side.addWidget(hint)

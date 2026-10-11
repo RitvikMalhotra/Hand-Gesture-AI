@@ -160,13 +160,19 @@ def print_boot(args, out, screen_w, screen_h):
     log("[BOOT] --- gates that must pass before anything moves ---")
     log("[BOOT] 1. ARM: %d fingers up held %.2fs (open palm). Disarmed = no actions at all."
         % (config.OPEN_PALM_FINGERS, config.OPEN_PALM_HOLD_S))
-    log("[BOOT] 2. MODE: same finger count for %d frames. 1=POINTER 2=PAGE else IDLE."
+    log("[BOOT] 2. MODE: same finger count for %d frames. 1=POINTER 2=PAGE 3=VOLUME else IDLE."
         % config.MODE_HOLD_FRAMES)
     log("[BOOT] 3. active region x %.2f..%.2f y %.2f..%.2f -> full screen"
         % (config.ACTIVE_X_MIN, config.ACTIVE_X_MAX, config.ACTIVE_Y_MIN, config.ACTIVE_Y_MAX))
     log("[BOOT] %s" % gestures.sensitivity_summary(screen_w, screen_h))
     log("[BOOT] click tap window    = %d ms, cooldown %.2fs"
         % (config.CLICK_TAP_WINDOW_MS, config.CLICK_COOLDOWN_S))
+    log("[BOOT] pointer drag        = finger still down at %d ms and palm moved > %.3f -> button down, finger up -> button up"
+        % (config.CLICK_TAP_WINDOW_MS, config.DRAG_COMMIT_DRIFT))
+    log("[BOOT] volume dwell        = %d ms of steady 3 fingers before the anchor is set and volume can change"
+        % config.VOLUME_DWELL_MS)
+    log("[BOOT] volume mode (3 up)  = dead zone %.3f, max %.2f%%/frame x sensitivity %.2f, scroll curve (sensitivity %.2f, exp %.2f)"
+        % (config.VOLUME_DEAD_ZONE, config.VOLUME_MAX_STEP, config.VOLUME_SENSITIVITY, config.SCROLL_SENSITIVITY, config.SCROLL_CURVE_EXP))
     log("[BOOT] page tap (refresh) = %d ms window, cooldown %.2fs, same tap gate as click"
         % (config.PAGE_TAP_WINDOW_MS, config.PAGE_TAP_COOLDOWN_S))
     log("[BOOT] scroll dead zone    = %.3f (was 0.040), axis lock floor = %.3f"
@@ -229,6 +235,8 @@ def run_live(args):
     last_beat = 0.0
     last_perf = time.perf_counter()
     glide = CursorGlide()
+    track = tracker.TrackStats(ctrl.log)
+    ctrl.log("[BOOT] mediapipe confidence = %s" % tracker.confidence_summary())
     ctrl.log("[BOOT] camera negotiated %dx%d @ %.0f fps requested (CAM_FPS=%d)"
              % (cam.actual_size[0], cam.actual_size[1], cam.negotiated_fps, config.CAM_FPS))
     for line in cam.settings_report:
@@ -242,6 +250,7 @@ def run_live(args):
                 config.SCROLL_DEAD_ZONE + 1.0 / config.SCROLL_SENSITIVITY))
     first_scroll_logged = False
     first_hscroll_logged = False
+    vol_sum, vol_t0 = 0.0, None
     ctrl.log("[BOOT] ready. show an open palm for %.2fs to arm. Esc quits." % config.OPEN_PALM_HOLD_S)
 
     try:
@@ -252,6 +261,7 @@ def run_live(args):
                 last_id = det.frame.frame_id
                 now = det.frame.captured_at
                 events = engine.update(det.landmarks, now)
+                track.add(det)
                 fired = time.perf_counter()
                 metrics.tick(fired)
 
@@ -310,10 +320,13 @@ def run_live(args):
 
                 for e in events:
                     metrics.add(e, fired)
-                    if e.kind == "move" and engine.dbg_map is not None and not engine._tap_active:
+                    if e.kind == "move" and engine.dbg_map is not None and not (engine._tap_active and not engine._drag_active):
                         rx, ry, fx, fy, nx, ny, sx, sy, gx, gy = engine.dbg_map
                         ctrl.log("[MAP] lm5_raw=(%.3f,%.3f) filt=(%.3f,%.3f) active_norm=(%.3f,%.3f) -> mapped=(%d,%d) x%.2f -> screen=(%d,%d) of %dx%d"
                                  % (rx, ry, fx, fy, nx, ny, sx, sy, config.CURSOR_SENSITIVITY, gx, gy, screen_w, screen_h))
+                        if engine._drag_active:
+                            ctrl.log("[MAP] drag: relative, cursor = hand + offset (%+.0f, %+.0f) -> (%d, %d)"
+                                     % (engine._drag_offset[0], engine._drag_offset[1], e.value[0], e.value[1]))
                     elif e.kind == "move":
                         ctrl.log("[MAP] tap in progress, cursor frozen at (%d, %d)"
                                  % (e.value[0], e.value[1]))
@@ -326,11 +339,26 @@ def run_live(args):
                         ctrl.log("[TILT] %-8s totals attempts=%d fires=%d released=%d blocked_by_cooldown=%d"
                                  % (e.value, engine.tilt_attempts, engine.tilt_fires,
                                     engine.tilt_released, engine.tilt_blocked))
+                    elif e.kind == "drag":
+                        ctrl.log(gestures.format_drag(e.value))
+                    elif e.kind == "volume_dwell":
+                        ctrl.log(gestures.format_volume_dwell(e.value))
+                    elif e.kind == "volume":
+                        # Every frame while held, so summed and logged at most every VOLUME_LOG_INTERVAL_S.
+                        vol_sum += e.value
+                        if vol_t0 is None:
+                            vol_t0 = fired
+                        if fired - vol_t0 >= config.VOLUME_LOG_INTERVAL_S:
+                            vanchor, vy, vdy, _ = engine.dbg_volume
+                            ctrl.log("[VOLUME] requested %+.1f%% over %.2f s, hand dy=%+.4f from anchor y=%.4f (dead zone %.3f)"
+                                     % (vol_sum, fired - vol_t0, vdy, vanchor, config.VOLUME_DEAD_ZONE))
+                            vol_sum, vol_t0 = 0.0, None
                     else:
                         ctrl.log("[EVENT] %s value=%r" % (e.kind, e.value))
                     if e.kind == "arm":
                         ctrl.log("[EVENT] ***** %s *****" % ("ARMED" if e.value else "DISARMED"))
-                    if engine.armed:
+                    # A drag release always goes out, even when disarming ended the drag.
+                    if engine.armed or e.kind == "drag":
                         if e.kind == "move" and config.CURSOR_INTERP:
                             glide.set_target(e.value[0], e.value[1])
                         else:
@@ -443,7 +471,9 @@ def run_live(args):
                                 "YES" if reset else "no"))
 
                 if recorder is not None:
-                    recorder.add(det.frame.frame_id, now, det.landmarks)
+                    recorder.add(det.frame.frame_id, now, det.landmarks, {
+                        "bright": None if det.brightness is None else round(det.brightness, 1),
+                        "score": None if det.score is None else round(det.score, 3)})
 
             # Glide the cursor between detections so movement is not stepped.
             if config.CURSOR_INTERP:
@@ -525,7 +555,7 @@ def run_replay(args):
         metrics.tick(t)
         for e in events:
             metrics.add(e, t)
-            if engine.armed:
+            if engine.armed or e.kind == "drag":
                 ctrl.dispatch(out, e)
     cpu_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -536,7 +566,7 @@ def run_replay(args):
     print("replay.file=%s" % args.replay)
     print("replay.frames=%d" % len(rows))
     print("replay.gesture_cpu_ms_per_frame=%.3f" % (cpu_ms / max(len(rows), 1)))
-    for kind in ("move", "click", "scroll", "hscroll", "nav", "key"):
+    for kind in ("move", "click", "scroll", "hscroll", "nav", "key", "mouse_down", "mouse_up", "volume"):
         print("replay.%s=%d" % (kind, counts.get(kind, 0)))
     if args.log:
         print("")

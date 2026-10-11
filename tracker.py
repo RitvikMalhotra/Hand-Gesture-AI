@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 import config
+import gestures
 
 # mediapipe 1.x removed mp.solutions, so this uses the Tasks HandLandmarker.
 import mediapipe as mp
@@ -36,10 +37,12 @@ class Frame:
 
 class Detection:
     # One detection result tied back to its source frame.
-    def __init__(self, frame, landmarks, detect_ms):
+    def __init__(self, frame, landmarks, detect_ms, score=None, brightness=None):
         self.frame = frame
         self.landmarks = landmarks  # numpy (21, 3) normalized, or None
         self.detect_ms = detect_ms
+        self.score = score            # handedness score 0..1; mediapipe does not give the hand presence score
+        self.brightness = brightness  # mean lightness 0..255 of the frame as captured
 
 
 def camera_api():
@@ -50,6 +53,35 @@ def camera_api():
     if name == "Darwin":
         return cv2.CAP_AVFOUNDATION
     return cv2.CAP_ANY
+
+
+# Held while this program has the camera open, so the app and main.py never open it at the same time.
+# A second opener on Windows gets one black frame per second from the driver instead of an error.
+CAMERA_MUTEX = "Local\\HandGestureCamera"
+ERROR_ALREADY_EXISTS = 183
+
+
+def _claim_camera():
+    # Returns a handle to keep until the camera is released, or raises if another HandGesture window has it.
+    if platform.system() != "Windows":
+        return None
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = k32.CreateMutexW(None, False, CAMERA_MUTEX)
+    if handle and ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        k32.CloseHandle(handle)
+        raise RuntimeError("camera is already in use by another HandGesture window (the app or main.py), close that one first")
+    return handle
+
+
+def _release_camera(handle):
+    if handle:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32")
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle(handle)
 
 
 class Camera:
@@ -69,10 +101,15 @@ class Camera:
         self.settings_report = []
         self._manual_exposure = False
         self._restore = []
+        self._claim = None
+        self._stall_n = 0
 
     def open(self):
+        self._claim = _claim_camera()
         self.cap = cv2.VideoCapture(config.CAM_INDEX, camera_api())
         if not self.cap.isOpened():
+            _release_camera(self._claim)
+            self._claim = None
             raise RuntimeError("Could not open camera %d" % config.CAM_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAM_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAM_HEIGHT)
@@ -119,9 +156,28 @@ class Camera:
                 self.grab_fps = self._rate_n / span
                 self._rate_t0 = now
                 self._rate_n = 0
+                self._check_stall(image)
             with self._lock:
                 self._count += 1
                 self._frame = Frame(image, self._count, now)
+
+    def _check_stall(self, image):
+        # One warning when the frame rate stays under CAM_STALL_FPS for CAM_STALL_SECONDS, one line when it recovers.
+        if self.grab_fps < config.CAM_STALL_FPS:
+            self._stall_n += 1
+            if self._stall_n == config.CAM_STALL_SECONDS:
+                bright = float(cv2.cvtColor(image[::4, ::4], cv2.COLOR_BGR2GRAY).mean())
+                # Tested: a capture opened while another program had the camera stays black at 1 frame/s even
+                # after that program lets go, so only reopening helps.
+                why = ("frames are black: another program probably has the camera (Camera app, Teams, a browser tab). "
+                       "Close it, then turn the camera off and on in the app or restart main.py"
+                       if bright < config.CAM_BLACK_LEVEL else "frames are not black: driver or USB problem, or a very long exposure")
+                print("[CAM] WARNING camera stalled: %.1f frames/s for %d s (asked for %d), brightness %.0f; %s"
+                      % (self.grab_fps, self._stall_n, config.CAM_FPS, bright, why), flush=True)
+        else:
+            if self._stall_n >= config.CAM_STALL_SECONDS:
+                print("[CAM] camera recovered: %.1f frames/s" % self.grab_fps, flush=True)
+            self._stall_n = 0
 
     def latest(self):
         # Newest frame only, old ones are dropped.
@@ -139,6 +195,8 @@ class Camera:
             for prop, value in self._restore:
                 self.cap.set(prop, value)
             self.cap.release()
+        _release_camera(self._claim)
+        self._claim = None
 
 
 _clahe = {}
@@ -222,7 +280,10 @@ class HandTracker:
                 self.detect_ms_avg = detect_ms
             else:
                 self.detect_ms_avg = 0.9 * self.detect_ms_avg + 0.1 * detect_ms
-            det = Detection(frame, result_to_array(result), detect_ms)
+            score = float(result.handedness[0][0].score) if result.handedness else None
+            # Every 4th pixel is enough for an average.
+            bright = float(cv2.cvtColor(frame.image[::4, ::4], cv2.COLOR_BGR2GRAY).mean())
+            det = Detection(frame, result_to_array(result), detect_ms, score, bright)
             with self._lock:
                 self._detection = det
 
@@ -236,6 +297,111 @@ class HandTracker:
             self._thread.join(timeout=2.0)
         if self._landmarker is not None:
             self._landmarker.close()
+
+
+def confidence_summary():
+    # The three mediapipe thresholds, for the boot log.
+    return ("detection %.2f (palm detector, only runs when no hand is tracked), presence %.2f (landmark model; "
+            "below it the hand is dropped that frame), tracking %.2f (box overlap with the last frame; below it the "
+            "palm detector runs again)" % (config.MIN_DETECT_CONF, config.MIN_PRESENCE_CONF, config.MIN_TRACK_CONF))
+
+
+class TrackStats:
+    # Tracking quality log: one [TRACK] line per dropout, plus a summary every TRACK_LOG_INTERVAL_S.
+    # Logging only, nothing here changes detection or gestures.
+    def __init__(self, log):
+        self.log = log
+        self._seen = None       # (t, landmarks, fingers, brightness) of the last frame with a hand
+        self._before = None     # the hand frame before that, for speed
+        self._gone_t = None     # when the hand went missing
+        self._gone_n = 0
+        self._new_window(None)
+
+    def _new_window(self, t):
+        self._w_t0 = t
+        self._w_frames = 0
+        self._w_hand = 0
+        self._w_drops = []
+        self._w_bright = []
+        self._w_scores = []
+        self._w_counts = []
+        self._w_fingers = 0
+        self._w_near = 0
+
+    def add(self, det):
+        t, lm = det.frame.captured_at, det.landmarks
+        if self._w_t0 is None:
+            self._w_t0 = t
+        self._w_frames += 1
+        if det.brightness is not None:
+            self._w_bright.append(det.brightness)
+        if lm is None:
+            if self._seen is not None and self._gone_t is None:
+                self._gone_t = t
+            self._gone_n += 1
+            self._w_counts.append(None)
+        else:
+            count = gestures.fingers_up(lm)
+            if self._gone_t is not None:
+                self._log_gap(t, lm, count, det.brightness)
+            self._before, self._seen = self._seen, (t, lm, count, det.brightness)
+            self._gone_t, self._gone_n = None, 0
+            self._w_hand += 1
+            self._w_counts.append(count)
+            if det.score is not None:
+                self._w_scores.append(det.score)
+            size = max(_dist2(lm[9], lm[0]), 1e-6)
+            for up, dt, dp in gestures.fingers_detail(lm):
+                self._w_fingers += 1
+                if abs(dt - dp) / size < config.TRACK_NEAR_LINE:
+                    self._w_near += 1
+        if t - self._w_t0 >= config.TRACK_LOG_INTERVAL_S:
+            self._summary(t)
+
+    def _log_gap(self, t, lm, count, bright):
+        gone = t - self._seen[0]
+        st, slm, scount, sbright = self._seen
+        slm = np.asarray(slm)
+        speed = "?"
+        if self._before is not None and st > self._before[0]:
+            speed = "%.2f/s" % (_dist2(slm[9], self._before[1][9]) / (st - self._before[0]))
+        edge = min(slm[:, 0].min(), slm[:, 1].min(), 1.0 - slm[:, 0].max(), 1.0 - slm[:, 1].max())
+        kind = "left the view" if gone > config.TRACK_DROPOUT_MAX_S else "DROPOUT"
+        if kind == "DROPOUT":
+            self._w_drops.append(gone)
+        self.log("[TRACK] %s: hand gone %.0f ms (%d frames). Before: %d fingers, moving %s, closest edge %.3f, "
+                 "brightness %s. After: %d fingers, brightness %s"
+                 % (kind, gone * 1000.0, self._gone_n, scount, speed, edge, _fmt_b(sbright), count, _fmt_b(bright)))
+
+    def _summary(self, t):
+        counts = self._w_counts
+        # Short blips: the count changes for 1-2 frames and comes back, not counting taps (to or from 0).
+        runs = []
+        for c in counts:
+            if runs and runs[-1][0] == c:
+                runs[-1][1] += 1
+            else:
+                runs.append([c, 1])
+        blips = sum(1 for i in range(1, len(runs) - 1)
+                    if runs[i][1] <= 2 and runs[i - 1][0] == runs[i + 1][0]
+                    and None not in (runs[i][0], runs[i - 1][0]) and 0 not in (runs[i][0], runs[i - 1][0]))
+        b, s = self._w_bright, self._w_scores
+        self.log("[TRACK] last %.1f s: %d frames, hand in %d (%.0f%%), dropouts %d%s, brightness %s, "
+                 "handedness score %s, finger-count blips %d, fingers near the up/down line %.1f%%"
+                 % (t - self._w_t0, self._w_frames, self._w_hand, 100.0 * self._w_hand / max(self._w_frames, 1),
+                    len(self._w_drops), " (longest %.0f ms)" % (max(self._w_drops) * 1000.0) if self._w_drops else "",
+                    "mean %.0f (min %.0f, max %.0f)" % (sum(b) / len(b), min(b), max(b)) if b else "?",
+                    "mean %.2f (min %.2f)" % (sum(s) / len(s), min(s)) if s else "?",
+                    blips, 100.0 * self._w_near / max(self._w_fingers, 1)))
+        self._new_window(t)
+
+
+def _dist2(a, b):
+    return float(np.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
+
+
+def _fmt_b(b):
+    return "?" if b is None else "%.0f" % b
 
 
 def draw_landmarks(image, landmarks):

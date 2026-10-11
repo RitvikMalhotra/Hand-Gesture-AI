@@ -6,6 +6,9 @@ CAM_WIDTH = 640
 CAM_HEIGHT = 480
 CAM_FPS = 60   # a request only, the camera negotiates down and the app prints what it got
 MIRROR = True  # flips left-right only, it never changes the y axis
+CAM_STALL_FPS = 5.0     # camera delivering fewer frames per second than this counts as stalled
+CAM_STALL_SECONDS = 3   # this many stalled seconds in a row prints a [CAM] WARNING
+CAM_BLACK_LEVEL = 10.0  # frames darker than this on average (0..255) count as black
 
 # --- camera exposure / gain: "auto" leaves the camera exactly as it is ---
 # Not standard across webcams or OS camera backends, the log prints what the camera did with the value.
@@ -64,6 +67,10 @@ CLICK_TAP_WINDOW_MS = 600   # index bends down and comes back up inside this
 # this window also delays a real POINTER -> IDLE switch by up to the same amount
 CLICK_COOLDOWN_S = 0.3
 
+# --- pointer mode drag: index held down past CLICK_TAP_WINDOW_MS while the hand moves ---
+DRAG_COMMIT_DRIFT = 0.04    # palm centre movement since finger-down (frame units, like ARM_HOLD_MAX_DRIFT) that starts a drag
+# checked when the tap window ends; under it the held finger still means POINTER -> IDLE as before
+
 # --- page mode refresh (index + middle tap), same rules as the click tap, own values ---
 PAGE_TAP_WINDOW_MS = 600    # both fingers bend down together and come back up inside this
 # this window also delays a real PAGE -> IDLE switch by up to the same amount
@@ -85,6 +92,16 @@ SCROLL_H_SENSITIVITY = 4.55 # speed ramp past the dead zone
 SCROLL_H_CURVE_EXP = 2.2    # curve shape, 1.0 is linear
 SCROLL_H_MAX_STEP = 6       # wheel units per frame at top speed, same units as vertical
 SCROLL_H_INVERT = False     # False: page content follows the hand, like vertical does
+
+# --- volume mode (3 fingers): the vertical scroll mechanism mapped to system volume, hand up = louder ---
+# Same anchor and curve as vertical scroll (SCROLL_SENSITIVITY, SCROLL_CURVE_EXP); dead zone and speed are its own.
+VOLUME_DEAD_ZONE = 0.03     # own value: scroll's real floor is the 0.03 axis lock, volume has no axis lock
+VOLUME_MAX_STEP = 1.5       # volume percent per frame at top speed, before VOLUME_SENSITIVITY
+VOLUME_SENSITIVITY = 1.0    # multiplies the volume speed, 1.0 = no change
+VOLUME_VERIFY_DELAY_S = 0.15     # once volume stops changing this long, the level is read again with brand-new COM objects and compared
+VOLUME_LOG_INTERVAL_S = 0.5 # volume changes are logged at most this often
+VOLUME_DWELL_MS = 300       # after entering VOLUME, 3 fingers must stay this long before the anchor is set and volume can change
+# so a hand passing through 3 fingers (palm to fewer fingers) does not touch the volume; longest pass-through seen: 159 ms
 
 # --- page mode tilt (back / forward): wrist-to-fingertips angle against the pose-start angle ---
 TILT_ANGLE_THRESHOLD = 18.0     # degrees of tilt that fire
@@ -128,6 +145,9 @@ MODE_FLAP_WINDOW_S = 1.0        # mode A->B->A this fast = one wrong mode switch
 TILT_SETTLE_WINDOW_S = 0.5      # tilt fire this soon after entering page mode = accidental
 TILT_REVERSAL_WINDOW_S = 1.5    # opposite tilt this soon = both accidental
 LOG_INTERVAL_S = 10.0           # live --log prints a line this often
+TRACK_LOG_INTERVAL_S = 10.0     # [TRACK] tracking quality summary this often
+TRACK_DROPOUT_MAX_S = 1.0       # hand gone longer than this = left the view, not a dropout
+TRACK_NEAR_LINE = 0.05          # finger counts as near the up/down line when tip and middle joint are this close (x hand size)
 
 # --- preview window ---
 WINDOW_NAME = "Hand Gesture Control"

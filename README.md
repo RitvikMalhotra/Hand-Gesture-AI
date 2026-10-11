@@ -5,8 +5,9 @@ Control your desktop with hand movements captured by a webcam. The app tracks on
 ## Gestures
 
 - Hold an open palm still for 0.5 seconds to arm or disarm control.
-- Raise one finger to enter pointer mode. Move your hand to move the cursor; tap your index finger down and back up to left-click.
+- Raise one finger to enter pointer mode. Move your hand to move the cursor; tap your index finger down and back up to left-click. To drag, keep the index finger down and move your hand; lift it to drop.
 - Raise two fingers to enter page mode. Move vertically or sideways to scroll; tilt your hand left or right for back or forward; tap both fingers down and back up to refresh.
+- Raise three fingers to enter volume mode. Move up for louder, down for quieter. Windows only.
 - Press Esc in the desktop app or CLI to quit.
 
 ## Setup (Windows)

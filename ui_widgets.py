@@ -24,6 +24,7 @@ MODE_COLORS = {
     gestures.MODE_IDLE: ("#475569", "#e2e8f0"),
     gestures.MODE_POINTER: ("#2563eb", "#ffffff"),
     gestures.MODE_PAGE: ("#9333ea", "#ffffff"),
+    gestures.MODE_VOLUME: ("#0d9488", "#ffffff"),
 }
 
 THEME_QSS = """
@@ -255,7 +256,7 @@ class SettingsPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
         groups = {}
-        for name in ("Pointer", "Click", "Scroll", "Tilt", "Camera"):
+        for name in ("Pointer", "Click", "Scroll", "Volume", "Tilt", "Camera"):
             box = QGroupBox(name)
             lay = QVBoxLayout(box)
             lay.setContentsMargins(10, 4, 10, 8)

@@ -15,6 +15,7 @@ FINGERS = [(8, 6), (12, 10), (16, 14), (20, 18)]
 MODE_IDLE = "IDLE"
 MODE_POINTER = "POINTER"
 MODE_PAGE = "PAGE"
+MODE_VOLUME = "VOLUME"
 
 # Modes with a tap: the finger count a tap comes back to, and the name its events log under.
 TAP_RETURN_FINGERS = {MODE_POINTER: 1, MODE_PAGE: 2}
@@ -31,6 +32,7 @@ class TapCounts:
         self.cooldown = 0
         self.uneven_starts = 0    # taps that started after a short in-between reading
         self.uneven_frames = 0    # in-between frames held during a tap instead of cancelling
+        self.drags = 0            # POINTER holds that became a drag
 
 
 class Event:
@@ -201,6 +203,14 @@ class GestureEngine:
         self._tap_frozen_xy = None
         self._tap_lead = 0      # in-between frames just before a possible drop
         self._tap_uneven = 0    # in-between frames in a row during a tap
+        self._tap_palm = None   # palm centre when the finger went down, for the drag check
+        self._drag_active = False
+        self._drag_start_t = None
+        self._drag_start_xy = None
+        self._vol_anchor = None
+        self._vol_dwell_t = None   # when the VOLUME dwell started
+        self._vol_live = False     # dwell done: anchor set, volume can change
+        self._drag_offset = (0.0, 0.0)
         self._last_tap = {MODE_POINTER: -1e9, MODE_PAGE: -1e9}
         self.tap_counts = {MODE_POINTER: TapCounts(), MODE_PAGE: TapCounts()}
         self.page_tap_frozen_frames = 0
@@ -236,6 +246,7 @@ class GestureEngine:
         self.dbg_tilt = None
         self.dbg_precedence = None
         self.dbg_owner = None
+        self.dbg_volume = None
 
         # PAGE mode stability counters, diagnostic only.
         self.page_frames = 0
@@ -287,6 +298,7 @@ class GestureEngine:
         self._tap_src = None
         self._tap_start_t = None
         self._tap_frozen_xy = None
+        self._tap_palm = None
         self._tap_lead = 0
         self._tap_uneven = 0
         self._fx.reset()
@@ -300,6 +312,8 @@ class GestureEngine:
             return MODE_POINTER
         if count == 2:
             return MODE_PAGE
+        if count == 3:
+            return MODE_VOLUME
         return MODE_IDLE
 
     def update(self, lm, now):
@@ -315,6 +329,7 @@ class GestureEngine:
         self.dbg_tilt = None
         self.dbg_precedence = None
         self.dbg_owner = None
+        self.dbg_volume = None
         mode_before = self.mode
 
         if lm is None:
@@ -331,6 +346,7 @@ class GestureEngine:
             events += tap_events
             self._reset_pointer()
             self._reset_page("hand lost")
+            events += self._reset_volume(now, "hand lost")
             events += self._track_mode(raw, now)
             self._track_page_stability(mode_before, None, now)
             return events
@@ -339,7 +355,7 @@ class GestureEngine:
         self.finger_count = count
 
         events += self._arm(lm, count, now)
-        raw, tap_events = self._tap_gate(count, self._raw_mode(count), now, True)
+        raw, tap_events = self._tap_gate(count, self._raw_mode(count), now, True, lm)
         events += tap_events
         events += self._track_mode(raw, now)
         self._track_page_stability(mode_before, count, now)
@@ -348,14 +364,23 @@ class GestureEngine:
         if not self.armed or self.switching:
             if self.mode != MODE_PAGE:
                 self._reset_page("disarmed or mid mode switch")
+            # A live VOLUME keeps its anchor through finger flicker; an unfinished dwell starts over.
+            if self.mode != MODE_VOLUME or not self._vol_live:
+                events += self._reset_volume(now, "left 3 fingers" if self.armed else "disarmed")
             return events
 
+        if self.mode != MODE_VOLUME:
+            events += self._reset_volume(now, "mode changed")
         if self.mode == MODE_POINTER:
             self._reset_page("pointer mode")
             events += self._pointer(lm, now)
         elif self.mode == MODE_PAGE:
             self._reset_pointer()
             events += self._page(lm, now)
+        elif self.mode == MODE_VOLUME:
+            self._reset_pointer()
+            self._reset_page("volume mode")
+            events += self._volume(lm, now)
         else:
             self._reset_page("idle mode")
         return events
@@ -492,10 +517,11 @@ class GestureEngine:
         # Some but not all of the tapping fingers up: one finger ahead of the other.
         return 0 < count < TAP_RETURN_FINGERS[src]
 
-    def _tap_gate(self, count, raw, now, hand_ok):
+    def _tap_gate(self, count, raw, now, hand_ok, lm=None):
         # Holds off the switch to IDLE so a quick tap can finish:
         # the index in POINTER (click), index + middle together in PAGE (refresh). Same rules for both.
         events = []
+        palm = None if lm is None else palm_center(lm)
 
         if not self._tap_active:
             # An uneven drop (2 -> 1 -> 0) leaves a short mode switch pending; that alone does not block the tap.
@@ -509,6 +535,7 @@ class GestureEngine:
                 self._tap_src = src
                 self._tap_start_t = now
                 self._tap_frozen_xy = self._last_xy if src == MODE_POINTER else None
+                self._tap_palm = palm
                 self.tap_counts[src].attempts += 1
                 if lead_ok:
                     self.tap_counts[src].uneven_starts += 1
@@ -521,6 +548,9 @@ class GestureEngine:
             else:
                 self._tap_lead = 0
             return raw, events
+
+        if self._drag_active:
+            return self._drag_gate(count, raw, now, hand_ok)
 
         src = self._tap_src
         tc = self.tap_counts[src]
@@ -557,6 +587,9 @@ class GestureEngine:
                 if between:
                     tc.uneven_frames += 1
                 return src, events
+            # Window over with the hand on the move: a POINTER hold becomes a drag instead of a mode switch.
+            if src == MODE_POINTER and count == 0 and self._drag_drift(palm) > config.DRAG_COMMIT_DRIFT:
+                return self._start_drag(now, lm, palm, events)
             self._end_tap()
             tc.timeout += 1
             events.append(Event(kind, "timeout", onset))
@@ -567,6 +600,84 @@ class GestureEngine:
         tc.cancelled += 1
         events.append(Event(kind, "cancel", onset))
         return raw, events
+
+    def _drag_drift(self, palm):
+        # Palm centre movement since the finger went down, in frame units.
+        if palm is None or self._tap_palm is None:
+            return 0.0
+        return math.hypot(palm[0] - self._tap_palm[0], palm[1] - self._tap_palm[1])
+
+    def _start_drag(self, now, lm, palm, events):
+        # Button goes down where the cursor was frozen. From here the cursor moves by how far the hand moves,
+        # starting at that point: offset = start point - where the hand maps now, so there is no jump.
+        self._drag_active = True
+        self._drag_start_t = now
+        self._fx.reset()
+        self._fy.reset()
+        hand_xy = self._map(lm, now)
+        start = self._tap_frozen_xy if self._tap_frozen_xy is not None else hand_xy
+        self._drag_start_xy = start
+        self._drag_offset = (start[0] - hand_xy[0], start[1] - hand_xy[1])
+        self.tap_counts[MODE_POINTER].drags += 1
+        events.append(Event("tap", "drag", self._tap_start_t))
+        events.append(Event("drag", ("down", start, self._drag_drift(palm), hand_xy), now))
+        return MODE_POINTER, events
+
+    def _drag_gate(self, count, raw, now, hand_ok):
+        # A committed drag keeps POINTER for as long as the finger stays down. Anything else lets go of the button.
+        if hand_ok and self.armed and count == 0:
+            return MODE_POINTER, []
+        if not hand_ok:
+            why = "hand lost"
+        elif not self.armed:
+            why = "disarmed"
+        elif count == 1:
+            why = "finger up"
+        else:
+            why = "%d fingers" % count
+        up = Event("drag", ("up", self._last_xy, self._drag_start_xy, now - self._drag_start_t, why), now)
+        self._drag_active = False
+        self._drag_start_t = None
+        self._drag_start_xy = None
+        self._end_tap()
+        return (MODE_POINTER if hand_ok and count == 1 else raw), [up]
+
+    def _reset_volume(self, now, reason):
+        # Drops the anchor and any dwell. Returns an "interrupted" event if a dwell was still running.
+        events = []
+        if self._vol_dwell_t is not None and not self._vol_live:
+            events.append(Event("volume_dwell", ("interrupted", now - self._vol_dwell_t, reason), now))
+        self._vol_anchor = None
+        self._vol_dwell_t = None
+        self._vol_live = False
+        return events
+
+    def _volume(self, lm, now):
+        # The vertical scroll mechanism on system volume: dead zone, same curve, anchor set once the dwell is done.
+        y = float(lm[config.HAND_POINT][1])
+        events = []
+        if not self._vol_live:
+            # Mode is VOLUME already, but nothing changes until 3 fingers have stayed for VOLUME_DWELL_MS.
+            if self._vol_dwell_t is None:
+                self._vol_dwell_t = now
+                events.append(Event("volume_dwell", ("started",), now))
+            held = now - self._vol_dwell_t
+            if held * 1000.0 < config.VOLUME_DWELL_MS:
+                return events
+            self._vol_live = True
+            self._vol_anchor = y
+            events.append(Event("volume_dwell", ("complete", held, y), now))
+        dy = y - self._vol_anchor
+        excess = abs(dy) - config.VOLUME_DEAD_ZONE
+        if excess <= 0.0:
+            self.dbg_volume = (self._vol_anchor, y, dy, 0.0)
+            return events
+        # Hand above the start point turns the volume up.
+        sign = 1.0 if dy < 0 else -1.0
+        t = min(excess * config.SCROLL_SENSITIVITY, 1.0)
+        amount = sign * (t ** config.SCROLL_CURVE_EXP) * config.VOLUME_MAX_STEP * config.VOLUME_SENSITIVITY
+        self.dbg_volume = (self._vol_anchor, y, dy, amount)
+        return events + [Event("volume", amount, now)]
 
     def _track_mode(self, raw, now):
         # A mode only changes after the new finger count holds for N frames.
@@ -599,11 +710,22 @@ class GestureEngine:
     def _pointer(self, lm, now):
         # Cursor follows the index knuckle, and holds still during a tap.
         events = []
-        if self._tap_active:
+        if self._tap_active and not self._drag_active:
             if self._tap_frozen_xy is not None:
                 events.append(Event("move", self._tap_frozen_xy, now))
             return events
 
+        gx, gy = self._map(lm, now)
+        if self._drag_active:
+            # Relative during a drag: hand movement since the drag started, added to the start point.
+            gx = min(max(gx + self._drag_offset[0], 0.0), self.screen_w - 1.0)
+            gy = min(max(gy + self._drag_offset[1], 0.0), self.screen_h - 1.0)
+        self._last_xy = (gx, gy)
+        events.append(Event("move", (gx, gy), now))
+        return events
+
+    def _map(self, lm, now):
+        # Index knuckle -> filtered -> active region -> screen -> sensitivity: the normal absolute cursor position.
         rx = float(lm[INDEX_MCP][0])
         ry = float(lm[INDEX_MCP][1])
         fx = self._fx(rx, now)
@@ -618,9 +740,7 @@ class GestureEngine:
         gx, gy = apply_sensitivity(sx, sy, self.screen_w, self.screen_h, config.CURSOR_SENSITIVITY)
         # Diagnostic only, nothing reads this back.
         self.dbg_map = (rx, ry, fx, fy, nx, ny, sx, sy, gx, gy)
-        self._last_xy = (gx, gy)
-        events.append(Event("move", (gx, gy), now))
-        return events
+        return gx, gy
 
     def _tilt(self, lm, now):
         # Wrist rotation against the pose-start angle. Fires back / forward plus one sideways wheel notch.
@@ -812,7 +932,12 @@ class Metrics:
         self.wrong_mode_switches = 0
         self.accidental_nav = 0
         self.n_actions = 0
-        self.taps = {"attempt": 0, "success": 0, "timeout": 0, "cancel": 0, "cooldown": 0}
+        self.taps = {"attempt": 0, "success": 0, "timeout": 0, "cancel": 0, "cooldown": 0, "drag": 0}
+        self.drag_ends = {}
+        self.volume_entries = 0
+        self.volume_dwell = {"started": 0, "complete": 0, "interrupted": 0}
+        self.volume_up_pct = 0.0
+        self.volume_down_pct = 0.0
         self.page_taps = {"attempt": 0, "success": 0, "timeout": 0, "cancel": 0, "cooldown": 0}
 
     def tick(self, now):
@@ -824,6 +949,18 @@ class Metrics:
         self.tick(now)
         if event.kind == "mode":
             self._mode_change(event.value, now)
+            if event.value == MODE_VOLUME:
+                self.volume_entries += 1
+        elif event.kind == "drag":
+            if event.value[0] == "up":
+                self.drag_ends[event.value[4]] = self.drag_ends.get(event.value[4], 0) + 1
+        elif event.kind == "volume_dwell":
+            self.volume_dwell[event.value[0]] += 1
+        elif event.kind == "volume":
+            if event.value > 0:
+                self.volume_up_pct += event.value
+            else:
+                self.volume_down_pct -= event.value
         elif event.kind == "tap":
             if event.value in self.taps:
                 self.taps[event.value] += 1
@@ -903,6 +1040,13 @@ class Metrics:
             "taps_cancelled": self.taps["cancel"],
             "taps_blocked_by_cooldown": self.taps["cooldown"],
             "tap_miss_rate_pct": round(100.0 * missed / att, 1) if att else 0.0,
+            "drags_started": self.taps["drag"],
+            "drag_ends_by_reason": dict(sorted(self.drag_ends.items())),
+            "volume_mode_entries": self.volume_entries,
+            "volume_dwells_completed": self.volume_dwell["complete"],
+            "volume_dwells_interrupted": self.volume_dwell["interrupted"],
+            "volume_requested_up_pct": round(self.volume_up_pct, 1),
+            "volume_requested_down_pct": round(self.volume_down_pct, 1),
             "duration_s": round(dur, 2),
             "actions_total": self.n_actions,
             "false_triggers_per_min": round(self.false_triggers / m, 2),
@@ -922,6 +1066,8 @@ REPORT_KEYS = [
     "taps_cancelled",
     "taps_blocked_by_cooldown",
     "tap_miss_rate_pct",
+    "drags_started",
+    "drag_ends_by_reason",
     "page_tap_attempts",
     "page_tap_refreshes_fired",
     "page_taps_timed_out_to_mode_switch",
@@ -933,6 +1079,11 @@ REPORT_KEYS = [
     "gesture_to_action_delay_ms_p95",
     "wrong_mode_switches_per_min",
     "accidental_back_forward_per_min",
+    "volume_mode_entries",
+    "volume_dwells_completed",
+    "volume_dwells_interrupted",
+    "volume_requested_up_pct",
+    "volume_requested_down_pct",
 ]
 
 
@@ -961,6 +1112,26 @@ def tilt_stats(engine):
         ("scroll_suppressed_by_tilt_frames", engine.scroll_suppressed_frames),
         ("scroll_won_over_small_tilt_frames", engine.scroll_won_frames),
     ]
+
+
+def format_drag(value):
+    # The [DRAG] log line for one drag event value.
+    def xy(p):
+        return "(unknown)" if p is None else "(%d, %d)" % (p[0], p[1])
+    if value[0] == "down":
+        return ("[DRAG] start at %s, button down (hand moved %.3f > DRAG_COMMIT_DRIFT %.3f); "
+                "relative tracking: hand maps to %s now, the cursor moves by hand movement from %s, no jump"
+                % (xy(value[1]), value[2], config.DRAG_COMMIT_DRIFT, xy(value[3]), xy(value[1])))
+    return "[DRAG] end at %s, started at %s, duration %.2f s, button up (%s)" % (xy(value[1]), xy(value[2]), value[3], value[4])
+
+
+def format_volume_dwell(value):
+    # The [VOLUME] log line for one dwell event value.
+    if value[0] == "started":
+        return "[VOLUME] dwell started, no volume change until 3 fingers stay %d ms" % config.VOLUME_DWELL_MS
+    if value[0] == "complete":
+        return "[VOLUME] dwell complete after %.0f ms, anchor set at y=%.4f, volume is live" % (value[1] * 1000.0, value[2])
+    return "[VOLUME] dwell interrupted after %.0f ms (%s), no volume change" % (value[1] * 1000.0, value[2])
 
 
 def format_tilt_stats(engine, prefix=""):

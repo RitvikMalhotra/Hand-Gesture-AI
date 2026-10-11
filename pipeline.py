@@ -44,6 +44,7 @@ class Pipeline:
         self.engine = gestures.GestureEngine(screen_w, screen_h)
         self.out = ctrl.make_controller()
         self.glide = CursorGlide()
+        self.track = tracker.TrackStats(ctrl.log)
         self.cam = None
         self.hands = None
         self._requests = queue.Queue()
@@ -64,6 +65,7 @@ class Pipeline:
                  % ((screen_w, screen_h) + ctrl.screen_metrics()))
         ctrl.log("[APP] output %s: %s" % (self.out.describe(), ctrl.keys_summary()))
         ctrl.log("[APP] %s" % gestures.sensitivity_summary(screen_w, screen_h))
+        ctrl.log("[APP] mediapipe confidence = %s" % tracker.confidence_summary())
 
     # ---- called from the GUI thread ----
 
@@ -206,8 +208,12 @@ class Pipeline:
         self.cam, self.hands = None, None
         if self._cam_state != CAM_ERROR:
             self._cam_state = CAM_OFF
-        # Tell the engine the hand is gone, so no tap or scroll anchor is left hanging.
-        self.engine.update(None, time.perf_counter())
+        # Tell the engine the hand is gone, so no tap or scroll anchor is left hanging,
+        # and let go of the button if a drag was running.
+        for e in self.engine.update(None, time.perf_counter()):
+            if e.kind == "drag":
+                ctrl.log("[APP] %s" % gestures.format_drag(e.value))
+                ctrl.dispatch(self.out, e)
         self.glide.clear()
         self._publish(None, None)
 
@@ -215,12 +221,18 @@ class Pipeline:
         # Same per-frame dispatch as main.run_live, without the diagnostic prints.
         eng = self.engine
         events = eng.update(det.landmarks, det.frame.captured_at)
+        self.track.add(det)
         for e in events:
             if e.kind == "arm":
                 ctrl.log("[APP] %s by open palm" % ("ARMED" if e.value else "DISARMED"))
             elif e.kind == "mode":
                 ctrl.log("[APP] mode %s" % e.value)
-            if eng.armed:
+            elif e.kind == "drag":
+                ctrl.log("[APP] %s" % gestures.format_drag(e.value))
+            elif e.kind == "volume_dwell":
+                ctrl.log("[APP] %s" % gestures.format_volume_dwell(e.value))
+            # A drag release always goes out, even when disarming ended the drag.
+            if eng.armed or e.kind == "drag":
                 if e.kind == "move" and config.CURSOR_INTERP:
                     self.glide.set_target(e.value[0], e.value[1])
                 else:

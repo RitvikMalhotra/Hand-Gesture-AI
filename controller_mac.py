@@ -55,6 +55,9 @@ class MacController(BaseController):
         self.gui.PAUSE = 0.0
         # Wheel units carry over between frames so small amounts still add up to whole pixels.
         self._carry = {"v": 0.0, "h": 0.0}
+        # While the left button is held (drag), moves must be drag events or apps see no drag.
+        self._button_down = False
+        self._volume_warned = False
         allowed = input_allowed()
         if allowed is False:
             dlog("[ACT] WARNING macOS reports this process may NOT post input events: gestures will do nothing. "
@@ -68,7 +71,8 @@ class MacController(BaseController):
     def move(self, x, y):
         # pyautogui.moveTo sleeps 10 ms after every move on macOS, too slow for the 120 Hz glide, so post directly.
         try:
-            ev = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (int(x), int(y)), Quartz.kCGMouseButtonLeft)
+            kind = Quartz.kCGEventLeftMouseDragged if self._button_down else Quartz.kCGEventMouseMoved
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, (int(x), int(y)), Quartz.kCGMouseButtonLeft)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
         except Exception as e:
             dlog("[ACT] move RAISED %s: %s" % (type(e).__name__, e))
@@ -125,7 +129,31 @@ class MacController(BaseController):
         else:
             dlog("[ACT] key unknown action %r, nothing sent" % action)
 
+    def mouse_down(self):
+        dlog("[ACT] pyautogui.mouseDown() at cursor %s" % (cursor_pos(),))
+        try:
+            self.gui.mouseDown()
+        except Exception as e:
+            dlog("[ACT] mouseDown RAISED %s: %s" % (type(e).__name__, e))
+            return
+        self._button_down = True
+
+    def mouse_up(self):
+        dlog("[ACT] pyautogui.mouseUp() at cursor %s" % (cursor_pos(),))
+        self._button_down = False
+        try:
+            self.gui.mouseUp()
+        except Exception as e:
+            dlog("[ACT] mouseUp RAISED %s: %s" % (type(e).__name__, e))
+
+    def volume(self, delta_pct):
+        # Volume control uses Windows Core Audio (pycaw); there is no macOS version yet.
+        if not self._volume_warned:
+            self._volume_warned = True
+            dlog("[ACT] volume control is not implemented on macOS, volume mode does nothing here")
+
     def release(self):
+        self._button_down = False
         # Nothing is held down, but make sure no button is stuck.
         try:
             self.gui.mouseUp()
